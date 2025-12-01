@@ -1,3 +1,10 @@
+/**
+ * trabalho pratico de banco de dados
+ * universidade federal de minas gerais
+ * * este arquivo contem todas as consultas utilizadas para a analise
+ * exploratoria, critica e integrada dos dados publicos.
+ */
+
 CREATE TABLE public.candidatos_unicos (
     nr_cpf_candidato TEXT NOT NULL PRIMARY KEY, 
     dt_geracao TEXT,
@@ -155,11 +162,25 @@ ALTER TABLE public.gastos_parlamentares
 ADD CONSTRAINT fk_gastos_candidato 
 FOREIGN KEY (cpf) REFERENCES public.candidatos_unicos (nr_cpf_candidato);
 
---- SELECOES ---
 
-SELECT COUNT(*) AS total_de_candidatos
-FROM candidatos_unicos;
 
+/* ========================================================================== */
+/* SECAO 5: ANALISE EXPLORATORIA DE DADOS                                     */
+/* estatisticas descritivas, volumetria e identificacao de outliers           */
+/* ========================================================================== */
+
+/**
+ * objetivo: levantar a volumetria total das tabelas.
+ * usado em: secao 5.1 (tabela 6 do relatorio).
+ */
+SELECT COUNT(*) AS total_de_candidatos FROM candidatos_unicos;
+SELECT SUM(vr_despesa_contratada) AS gasto_total_campanhas FROM despesas_campanha;
+SELECT SUM(vlrliquido) AS total_gasto_parlamentar FROM gastos_parlamentares;
+
+/**
+ * objetivo: analisar a distribuicao de candidatos por cargo e genero.
+ * usado em: secao 5 (analise descritiva).
+ */
 SELECT ds_cargo, COUNT(*) AS total_candidatos
 FROM candidatos_unicos
 GROUP BY ds_cargo
@@ -169,16 +190,14 @@ SELECT ds_genero, COUNT(*) AS total
 FROM candidatos_unicos
 GROUP BY ds_genero;
 
-SELECT SUM(vr_despesa_contratada) AS gasto_total_campanhas
-FROM despesas_campanha;
-
+/**
+ * objetivo: identificar outliers (valores discrepantes) nos gastos.
+ * usado em: secao 5 (analise de distribuicao).
+ */
 SELECT nr_cpf_candidato, ds_despesa, vr_despesa_contratada
 FROM despesas_campanha
 ORDER BY vr_despesa_contratada DESC
 LIMIT 10;
-
-SELECT SUM(vlrliquido) AS total_gasto_parlamentar
-FROM gastos_parlamentares;
 
 SELECT txnomeparlamentar, txtdescricao, vlrliquido
 FROM gastos_parlamentares
@@ -190,19 +209,88 @@ FROM gastos_parlamentares
 GROUP BY txtdescricao
 ORDER BY valor_total_gasto DESC;
 
--- TESTE --
+/**
+ * objetivo: calcular a barreira economica (custo medio para ser eleito).
+ * logica: agrupa por situacao (eleito/nao eleito) usando codigos do tse.
+ * usado em: secao 5 (tabela 7 do relatorio).
+ */
+WITH gastos_por_candidato AS (
+    SELECT 
+        c.nr_cpf_candidato,
+        CASE 
+            WHEN c.cd_sit_tot_turno IN ('1', '2', '3') THEN 'ELEITO'
+            WHEN c.cd_sit_tot_turno = '5' THEN 'SUPLENTE'
+            ELSE 'NÃO ELEITO' 
+        END AS status_simplificado,
+        SUM(d.vr_despesa_contratada) AS total_gasto
+    FROM 
+        candidatos_unicos c
+    JOIN 
+        despesas_campanha d ON c.nr_cpf_candidato = d.nr_cpf_candidato
+    WHERE 
+        c.ds_cargo LIKE '%DEPUTADO FEDERAL%'
+    GROUP BY 
+        c.nr_cpf_candidato, c.cd_sit_tot_turno
+)
+SELECT 
+    status_simplificado,
+    COUNT(*) AS qtd_candidatos,
+    ROUND(AVG(total_gasto), 2) AS media_investimento,
+    ROUND(MIN(total_gasto), 2) AS gasto_minimo,
+    ROUND(MAX(total_gasto), 2) AS gasto_maximo
+FROM 
+    gastos_por_candidato
+GROUP BY 
+    status_simplificado
+ORDER BY 
+    media_investimento DESC;
 
--- 1 --
+
+/* ========================================================================== */
+/* SECAO 6: ANALISE CRITICA DAS FONTES                                        */
+/* identificacao de inconsistencias semanticas e problemas de qualidade       */
+/* ========================================================================== */
+
+/**
+ * objetivo: detectar inconsistencias semanticas graves (anomalia).
+ * logica: busca empresas de engenharia/construcao recebendo por marketing.
+ * usado em: secao 6 (tabela 8 do relatorio).
+ */
+SELECT 
+    txnomeparlamentar,
+    txtfornecedor,
+    txtcnpjcpf,
+    txtdescricao AS tipo_servico,
+    SUM(vlrliquido) AS total_recebido
+FROM 
+    gastos_parlamentares
+WHERE 
+    (txtfornecedor ILIKE '%ENGENHARIA%' OR txtfornecedor ILIKE '%CONSTRUTORA%')
+    AND txtdescricao = 'DIVULGAÇÃO DA ATIVIDADE PARLAMENTAR.'
+GROUP BY 
+    txnomeparlamentar, txtfornecedor, txtcnpjcpf, txtdescricao
+ORDER BY 
+    total_recebido DESC;
+
+
+/* ========================================================================== */
+/* SECAO 7: ANALISE INTEGRADA DOS DADOS                                       */
+/* cruzamento entre campanha e mandato (join entre tabelas)                   */
+/* ========================================================================== */
+
+/**
+ * objetivo: identificar fornecedores que atuam nas duas pontas (visao de mercado).
+ * logica: normaliza cnpj e une as tabelas para ver totais acumulados.
+ * usado em: secao 7 (analise de recorrencia).
+ */
 WITH campanha AS (
     SELECT
-        -- Normaliza o CNPJ (remove ./ - etc)
         regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g') AS cnpj_limpo,
         MAX(nm_fornecedor) AS nome_fornecedor_campanha,
         SUM(vr_despesa_contratada) AS total_gasto_campanha
     FROM
         despesas_campanha
     WHERE
-        -- Filtra para garantir que é um CNPJ (14 dígitos)
         LENGTH(regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g')) = 14
     GROUP BY
         cnpj_limpo
@@ -231,9 +319,12 @@ ORDER BY
     c.total_gasto_cota DESC
 LIMIT 20;
 
--- 2 --
-
-WITH despesas_limpas AS (
+/**
+ * objetivo: identificar continuidade contratual (mesmo politico, mesma empresa).
+ * logica: busca empresas contratadas pelo mesmo cpf na campanha e no mandato.
+ * usado em: secao 7 (analise de fidelidade e figura 4).
+ */
+WITH despesas AS (
     SELECT
         regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g') AS cnpj_fornecedor,
         nr_cpf_candidato AS cpf_candidato,
@@ -246,7 +337,7 @@ WITH despesas_limpas AS (
     GROUP BY
         cnpj_fornecedor, cpf_candidato
 ),
-gastos_limpos AS (
+gastos AS (
     SELECT
         regexp_replace(txtcnpjcpf, '[^0-9]', '', 'g') AS cnpj_fornecedor,
         cpf AS cpf_parlamentar,
@@ -259,7 +350,6 @@ gastos_limpos AS (
     GROUP BY
         cnpj_fornecedor, cpf_parlamentar
 )
-
 SELECT
     c.nm_candidato AS nome_politico,
     COALESCE(d.nome_fornecedor, g.nome_fornecedor) AS nome_fornecedor,
@@ -268,10 +358,100 @@ SELECT
 FROM
     candidatos_unicos c
 JOIN
-    despesas_limpas d ON c.nr_cpf_candidato = d.cpf_candidato
+    despesas d ON c.nr_cpf_candidato = d.cpf_candidato
 JOIN
-    gastos_limpos g ON c.nr_cpf_candidato = g.cpf_parlamentar 
+    gastos g ON c.nr_cpf_candidato = g.cpf_parlamentar 
                    AND d.cnpj_fornecedor = g.cnpj_fornecedor
 ORDER BY
     g.total_gasto_cota DESC
+LIMIT 50;
+
+/**
+ * objetivo: identificar escalada de valores (aumento expressivo no mandato).
+ * logica: filtra casos onde o gasto publico (cota) superou o gasto de campanha.
+ * usado em: secao 7 (analise de escalada de valores).
+ */
+WITH despesas AS (
+    SELECT
+        regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g') AS cnpj_fornecedor,
+        nr_cpf_candidato AS cpf_candidato,
+        MAX(nm_fornecedor) AS nome_fornecedor,
+        SUM(vr_despesa_contratada) AS total_gasto_campanha
+    FROM
+        despesas_campanha
+    WHERE
+        LENGTH(regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g')) = 14
+        AND vr_despesa_contratada > 0
+    GROUP BY
+        cnpj_fornecedor, cpf_candidato
+),
+gastos AS (
+    SELECT
+        regexp_replace(txtcnpjcpf, '[^0-9]', '', 'g') AS cnpj_fornecedor,
+        cpf AS cpf_parlamentar,
+        MAX(txtfornecedor) AS nome_fornecedor,
+        SUM(vlrliquido) AS total_gasto_cota
+    FROM
+        gastos_parlamentares
+    WHERE
+        LENGTH(regexp_replace(txtcnpjcpf, '[^0-9]', '', 'g')) = 14
+    GROUP BY
+        cnpj_fornecedor, cpf_parlamentar
+)
+SELECT
+    c.nm_candidato AS nome_politico,
+    COALESCE(d.nome_fornecedor, g.nome_fornecedor) AS nome_fornecedor,
+    TO_CHAR(d.total_gasto_campanha, 'L9G999G999D99') as gasto_campanha,
+    TO_CHAR(g.total_gasto_cota, 'L9G999G999D99') as gasto_mandato,
+    (g.total_gasto_cota - d.total_gasto_campanha) AS aumento_absoluto,
+    ROUND(((g.total_gasto_cota - d.total_gasto_campanha) / d.total_gasto_campanha) * 100, 2) AS pct_aumento
+FROM
+    candidatos_unicos c
+JOIN
+    despesas d ON c.nr_cpf_candidato = d.cpf_candidato
+JOIN
+    gastos g ON c.nr_cpf_candidato = g.cpf_parlamentar 
+                   AND d.cnpj_fornecedor = g.cnpj_fornecedor
+WHERE 
+    g.total_gasto_cota > d.total_gasto_campanha 
+ORDER BY 
+    aumento_absoluto DESC 
+LIMIT 20;
+
+/**
+ * objetivo: analisar a capilaridade dos fornecedores (super-fornecedores).
+ * logica: conta quantos politicos distintos cada empresa atende.
+ * usado em: secao 7 (figura 5 do relatorio).
+ */
+WITH fornecedores_unificados AS (
+    SELECT 
+        regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g') AS cnpj,
+        nm_fornecedor AS nome,
+        nr_cpf_candidato AS politico_id,
+        'CAMPANHA' as origem
+    FROM despesas_campanha
+    WHERE LENGTH(regexp_replace(nr_cpf_cnpj_fornecedor, '[^0-9]', '', 'g')) = 14
+    UNION ALL
+    SELECT 
+        regexp_replace(txtcnpjcpf, '[^0-9]', '', 'g') AS cnpj,
+        txtfornecedor AS nome,
+        cpf AS politico_id,
+        'MANDATO' as origem
+    FROM gastos_parlamentares
+    WHERE LENGTH(regexp_replace(txtcnpjcpf, '[^0-9]', '', 'g')) = 14
+)
+SELECT 
+    MAX(nome) as nome_fornecedor,
+    cnpj,
+    COUNT(DISTINCT politico_id) AS qtd_politicos_atendidos,
+    COUNT(DISTINCT origem) AS atua_nas_duas_fases,
+    TO_CHAR(SUM(1), '999G999') AS total_transacoes
+FROM 
+    fornecedores_unificados
+GROUP BY 
+    cnpj
+HAVING 
+    COUNT(DISTINCT politico_id) > 10
+ORDER BY 
+    qtd_politicos_atendidos DESC
 LIMIT 20;
